@@ -4,3 +4,4 @@ opencv-python-headless==4.11.0.86
 numpy==2.2.4
 dlib==19.24.6
 face_recognition_models
+setuptools==69.5.1
