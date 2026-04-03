@@ -10,9 +10,14 @@ import face_recognition
 import cv2
 import numpy as np
 import os
+import re
+import boto3
 from datetime import datetime
 
 app = Flask(__name__)
+
+s3 = boto3.client('s3')
+BUCKET_NAME = "surveillance-frames"
 
 # ─── Known Faces Database (loaded at startup) ───
 known_face_encodings = []
@@ -41,9 +46,22 @@ def load_known_faces():
     if not os.path.exists(KNOWN_FACES_DIR):
         os.makedirs(KNOWN_FACES_DIR)
         print(f"📁 Created empty known_faces/ directory at: {KNOWN_FACES_DIR}")
-        print("   ⚠️  Add photos of known people to this folder!")
-        print("   📝 Name format: person_name.jpg (e.g., devashish.jpg)")
-        return
+
+    # Phase 11: S3 Sync
+    try:
+        print(f"\n☁️ Syncing known faces from s3://{BUCKET_NAME}/known_faces/")
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="known_faces/")
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                key = obj['Key']
+                if key.endswith('/'): continue
+                
+                local_path = os.path.join(KNOWN_FACES_DIR, os.path.basename(key))
+                if not os.path.exists(local_path):
+                    s3.download_file(BUCKET_NAME, key, local_path)
+                    print(f"   ⬇️ Downloaded: {os.path.basename(key)}")
+    except Exception as e:
+        print(f"   ⚠️ S3 Sync skipped: {e}")
 
     valid_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
     loaded = 0
@@ -62,8 +80,14 @@ def load_known_faces():
 
             if len(encodings) > 0:
                 known_face_encodings.append(encodings[0])
-                # Convert filename to clean name: "john_doe" → "John Doe"
-                clean_name = name.replace("_", " ").title()
+                
+                # Phase 11: Multi-Angle name regex (e.g., devashish_1 -> devashish)
+                clean_name = name
+                match = re.match(r"^(.+?)[_-](?:\d+|front|side|left|right|up|down)$", name, re.IGNORECASE)
+                if match:
+                    clean_name = match.group(1)
+                
+                clean_name = clean_name.replace("_", " ").title()
                 known_face_names.append(clean_name)
                 loaded += 1
                 print(f"   ✅ Loaded: {clean_name} ({filename})")
@@ -74,6 +98,14 @@ def load_known_faces():
             print(f"   ❌ Error loading {filename}: {e}")
 
     print(f"\n   📊 Total known faces loaded: {loaded}")
+
+
+def check_liveness(face_image):
+    """ Phase 11: Anti-Spoofing Laplacian Variance Heuristic """
+    gray = cv2.cvtColor(face_image, cv2.COLOR_RGB2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    # A flat photo/screen often lacks micro-textures (variance < ~60)
+    return variance > 60
 
 
 def recognize_faces(frame_bytes):
@@ -136,34 +168,48 @@ def recognize_faces(frame_bytes):
         confidence = 0.0
 
         if len(known_face_encodings) > 0:
-            # Compare this face to all known faces
             face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
-
-            # Find best match (lowest distance)
             best_match_index = np.argmin(face_distances)
             best_distance = face_distances[best_match_index]
-
-            # Convert distance to confidence (lower distance = higher confidence)
             confidence = round(1.0 - best_distance, 4)
 
-            # Check if the match is within tolerance
             if best_distance <= TOLERANCE:
                 name = known_face_names[best_match_index]
                 known_count += 1
             else:
                 unknown_count += 1
         else:
-            # No known faces loaded — all faces are "Unknown"
             unknown_count += 1
             confidence = 0.0
 
-        # Scale face location back to original size (since we resized by 0.5)
-        top, right, bottom, left = face_locations[i]
+        # Extract Face Crop
+        top_raw, right_raw, bottom_raw, left_raw = face_locations[i]
+        face_crop = small_frame[top_raw:bottom_raw, left_raw:right_raw]
+
+        # Phase 11: Liveness Check & Auto-Upload Queue
+        if face_crop.size > 0:
+            is_live = check_liveness(face_crop)
+            if not is_live:
+                name = "SPOOF_DETECTED"
+                confidence = 0.0
+                if name != "Unknown": # Override counts
+                    known_count = max(0, known_count - 1)
+                    unknown_count += 1
+            
+            # If Unknown (or spoof), Auto-Upload to S3 Pending Queue
+            elif name == "Unknown":
+                try:
+                    face_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                    _, buffer = cv2.imencode('.jpg', face_bgr)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    s3.put_object(Bucket=BUCKET_NAME, Key=f"pending_faces/unknown_{ts}.jpg", Body=buffer.tobytes(), ContentType="image/jpeg")
+                except: pass
+
         location = {
-            "top": top * 2,
-            "right": right * 2,
-            "bottom": bottom * 2,
-            "left": left * 2
+            "top": top_raw * 2,
+            "right": right_raw * 2,
+            "bottom": bottom_raw * 2,
+            "left": left_raw * 2
         }
 
         faces_result.append({
