@@ -139,16 +139,6 @@ def recognize_faces(frame_bytes):
     # Convert BGR (OpenCV) to RGB (face_recognition expects RGB)
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    if frame_rgb.shape[0] < 2 or frame_rgb.shape[1] < 2:
-        return {
-            "faces_detected": 0,
-            "faces": [],
-            "unknown_count": 0,
-            "known_count": 0,
-            "threat": False,
-            "message": "Frame dimensions too small"
-        }
-
     # Resize frame for faster processing (scale down by 50%)
     small_frame = cv2.resize(frame_rgb, (0, 0), fx=0.5, fy=0.5)
 
